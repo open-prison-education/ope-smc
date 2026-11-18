@@ -21,6 +21,7 @@ import tempfile
 from ednet.canvas import Canvas
 from pytubefix import YouTube
 from urllib.parse import urlparse
+import yt_proxy_health
 
 
 # Help shut up pylance warnings
@@ -110,74 +111,90 @@ def set_session_value(namespace="ui", control=None, key=None, value=None):
     return True
 
 
-def check_proxy(proxy_url, timeout=5):
-    """ Quick TCP reachability for an http(s) proxy URL like "http://1.2.3.4:35000"
-    or "http://user:pass@host:port". Returns (ok: bool, msg: str).
+def record_proxy_result(proxy_url, status, msg="", downloaded=False):
+    """Save the outcome of a health check or a real request against a youtube_proxy_list row.
+    Bad results back off the next check (15m, 30m, 1h ... 6h).
+
+    Only a completed download (downloaded=True) resets the backoff. A passing health check
+    makes the proxy usable again but keeps its failure count, because some IPs pass the
+    check and still get 403 on the video itself - each repeat failure doubles their wait."""
+    row = db(db.youtube_proxy_list.proxy_url == proxy_url).select().first()
+    if row is None:
+        return
+    now = datetime.datetime.now()
+    failures = row.consecutive_failures or 0
+    fields = dict(status=status, status_msg=(msg or "")[:500], last_checked_on=now)
+    if status == yt_proxy_health.OK:
+        if downloaded:
+            failures = 0
+            fields.update(last_ok_on=now)
+    elif status in yt_proxy_health.BAD_STATUSES:
+        failures += 1
+        fields.update(last_error_on=now)
+        if status == yt_proxy_health.RATE_LIMITED:
+            fields.update(last_429_error_on=now)
+    fields.update(consecutive_failures=failures,
+                  next_check_on=yt_proxy_health.next_check_after(status, failures, now))
+    row.update_record(**fields)
+    db.commit()
+
+
+def get_youtube_proxies(verify=True, max_proxies=3):
+    """Return up to max_proxies enabled proxy_url strings, most likely to work first.
+
+    Callers try them in order: the first one normally works, the rest are a fallback for
+    a proxy that got flagged since its last check.
+
+    Order:
+      1. proxies whose last check/use was OK - least recently used first so load spreads out
+         (clean IPs get flagged quickly if one of them takes every request)
+      2. proxies never checked (or whose last check gave an unexpected answer), least recently used first
+      3. bad proxies (bot/dead/...) that are due for a re-check - a dead port can come back
+    Bad proxies not due for a re-check are skipped.
+
+    With verify, OK proxies get a quick alive check and the others get the full health probe
+    (both in parallel) before being returned, so a proxy that went bad costs seconds, not a
+    failed download attempt. Results are saved via record_proxy_result.
     """
-    if not proxy_url:
-        return False, "empty proxy url"
+    now = datetime.datetime.now()
+    never = datetime.datetime.min
+    rows = db(db.youtube_proxy_list.enabled == True).select()
 
-    try:
-        parsed = urlparse(proxy_url)
-        host = parsed.hostname
-        port = parsed.port
-        if not host or not port:
-            return False, f"could not parse host/port from proxy url: {proxy_url}"
-    except Exception as ex:
-        return False, f"could not parse proxy url {proxy_url}: {ex}"
+    ok_rows = sorted([r for r in rows if r.status == yt_proxy_health.OK],
+                     key=lambda r: r.last_request_on or never)
+    unknown_rows = sorted([r for r in rows if r.status in (None, "", yt_proxy_health.UNKNOWN)],
+                          key=lambda r: r.last_request_on or never)
+    due_bad_rows = sorted([r for r in rows if r.status in yt_proxy_health.BAD_STATUSES
+                           and (r.next_check_on is None or r.next_check_on <= now)],
+                          key=lambda r: r.next_check_on or never)
 
-    sock = None
-    try:
-        sock = socket.create_connection((host, port), timeout=timeout)
-        return True, "ok"
-    except (socket.timeout, ConnectionRefusedError, OSError) as ex:
-        return False, f"{type(ex).__name__}: {ex}"
-   
-    finally:
-        if sock is not None:
-            sock.close()
+    ret = [r.proxy_url for r in ok_rows]
+    if verify:
+        alive = yt_proxy_health.check_alive_many(ret)
+        for url, (ok, msg) in alive.items():
+            if not ok:
+                print(f"YouTube proxy failed alive check: {urlparse(url).hostname}:{urlparse(url).port} {msg}")
+                record_proxy_result(url, yt_proxy_health.DEAD, msg)
+        ret = [url for url in ret if alive[url][0]]
 
+    others = [r.proxy_url for r in unknown_rows + due_bad_rows]
+    while len(ret) < max_proxies and others:
+        batch, others = others[:10], others[10:]
+        if not verify:
+            ret.extend(batch)
+            continue
+        results = yt_proxy_health.probe_many(batch)
+        for url in batch:
+            status, msg = results[url]
+            record_proxy_result(url, status, msg)
+            # UNKNOWN means the probe got an unexpected answer - let a real request decide
+            if status in (yt_proxy_health.OK, yt_proxy_health.UNKNOWN):
+                ret.append(url)
+            else:
+                print(f"YouTube proxy failed health check: {urlparse(url).hostname}:{urlparse(url).port} {status} {msg}")
 
+    return ret[:max_proxies]
 
-def get_youtube_proxies(randomize=False, verify_tcp=True, tcp_timeout=5, max_proxies=5):
-    """Return enabled proxy_url strings from youtube_proxy_list.
-
-    When verify_tcp is True (default), each candidate must accept a TCP connection
-    to its host:port; unreachable rows are skipped and last_error_on is updated.
-    Set verify_tcp=False only if you need the raw DB list (e.g. admin tooling).
-    """
-    # Skip proxies if they have had an error less than this
-    not_before = datetime.datetime.now() - datetime.timedelta(minutes=10)
-
-    query = (db.youtube_proxy_list.enabled==True)
-    # Random order so you get a possible different item from the list each time
-    if randomize == True:
-        rows = db(query).select(orderby='<random>')
-    else:
-        rows = db(query).select(orderby=db.youtube_proxy_list.last_request_on)
-    ret = list()
-    for row in rows:
-        if row.last_error_on is None or row.last_error_on < not_before:
-            url = row["proxy_url"]
-            if verify_tcp:
-                ok, check_msg = check_proxy(url, timeout=tcp_timeout)
-                if not ok:
-                    print(f"YouTube proxy TCP check failed: {url} {check_msg}")
-                    try:
-                        db(db.youtube_proxy_list.id == row.id).update(
-                            last_error_on=datetime.datetime.now()
-                        )
-                        db.commit()
-                    except Exception:
-                        pass
-                    continue
-            ret.append(url)
-            if len(ret) >= max_proxies:
-                break
-        else:
-            print(f"Skipping proxy - too soon since since last error: {row.proxy_url}")
-
-    return ret
 
 def get_flashcards_folder_path(flashcard_id):
     (w2py_folder, applications_folder, app_folder) = get_app_folders()

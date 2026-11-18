@@ -632,6 +632,13 @@ db.define_table("youtube_proxy_list",
       auth.signature,
       Field("last_error_on", "datetime"),
       Field("last_request_on", "datetime"),
+      # Health tracking - see modules/yt_proxy_health.py
+      Field("status", "string", default="unknown"),
+      Field("status_msg", "string", default=""),
+      Field("last_checked_on", "datetime"),
+      Field("last_ok_on", "datetime"),  # last completed download
+      Field("consecutive_failures", "integer", default=0),
+      Field("next_check_on", "datetime"),
 )
 
 

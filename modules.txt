@@ -36,5 +36,6 @@ jwcrypto
 Pillow
 python-dateutil
 redis
-yt_dlp
+yt-dlp[default]  # install with --pre for nightly builds, YouTube changes often
+bgutil-ytdlp-pot-provider  # PO tokens for yt-dlp - needs the brainicism/bgutil-ytdlp-pot-provider server running
 

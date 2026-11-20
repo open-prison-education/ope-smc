@@ -244,9 +244,10 @@ def media_list():
         )
         
         vtt_files = get_media_captions_list(row.media_guid)
-        for v_file in vtt_files:
+        english = english_caption_track(vtt_files)
+        if english:
             file_list.append(
-                base_url + row.media_guid + "_" + v_file + ".vtt"
+                base_url + row.media_guid + "_" + english + ".vtt"
             )
         
         item["files"] = file_list
@@ -696,18 +697,13 @@ def player():
         source_mobile_mp4 = URL('static', 'media' + "/" + prefix + "/" + movie_id + ".mobile.mp4")
         source_webm = URL('static', 'media' + "/" + prefix + "/" + movie_id + ".webm")
 
-        # Get list of vtt files
-        vtt_files = get_media_captions_list(movie_id)
-        
-        # Build up the <tracks> tags
-        for f in vtt_files:
-            #<track kind="captions" src="source_en_subtitles"" srclang="en" label="English" default>
-            default_txt = ""
-            if f == "en":
-                default_txt = "default"
-            subtitles_html += "\n<track kind=\"captions\" src=\"" + \
-                URL('static', 'media' + "/" + prefix + "/" + movie_id + "_" + f + ".vtt") \
-                + "\" srclang=\"" + f + "\" label=\"" + vtt_files[f][1] + "\" " + default_txt + ">"
+        # One English track. Other languages are not offered, and it is on by default
+        # so the viewer does not have to pick it out of a long list.
+        english = english_caption_track(get_media_captions_list(movie_id))
+        if english:
+            subtitles_html = "\n<track kind=\"captions\" src=\"" + \
+                URL('static', 'media' + "/" + prefix + "/" + movie_id + "_" + english + ".vtt") \
+                + "\" srclang=\"en\" label=\"English\" default>"
 
         
         media_file = db(db.media_files.media_guid==movie_id).select().first()

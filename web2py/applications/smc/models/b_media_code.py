@@ -22,6 +22,7 @@ from ednet.canvas import Canvas
 from pytubefix import YouTube
 from urllib.parse import urlparse
 import yt_proxy_health
+from yt_dlp_video import _english_caption_rank
 
 
 # Help shut up pylance warnings
@@ -359,6 +360,21 @@ def save_media_caption_file(file_guid, language, file_name, f_handle):
         print("Error saving caption file! " + file_guid + "/" + dest_path + "/" + language + "\n" + str(ex))
     
     return ret
+
+def english_caption_track(caption_files):
+    """The English caption code to show, or None. Prefers a plain "en" track."""
+    best = None
+    best_key = None
+    for code in caption_files or {}:
+        rank = _english_caption_rank(code)
+        if rank is None:
+            continue
+        candidate = (rank, code.lower())
+        if best is None or candidate < best_key:
+            best = code
+            best_key = candidate
+    return best
+
 
 def get_media_captions_list(file_guid):
     """

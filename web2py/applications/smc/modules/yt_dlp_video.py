@@ -155,6 +155,93 @@ def _srt_time(seconds):
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
 
+def _vtt_time(seconds):
+    return _srt_time(seconds).replace(",", ".")
+
+
+def _parse_timestamp(value):
+    value = value.strip().replace(",", ".")
+    parts = value.split(":")
+    if len(parts) == 3:
+        hours, minutes, secs = parts
+    elif len(parts) == 2:
+        hours, minutes, secs = "0", parts[0], parts[1]
+    else:
+        hours, minutes, secs = "0", "0", parts[0]
+    return int(hours) * 3600 + int(minutes) * 60 + float(secs)
+
+
+def trim_cue_ends(cues):
+    """End each cue when the next one starts.
+
+    YouTube's auto captions keep the previous line on screen for several seconds
+    after the next line has started. A player then stacks both, with the new line
+    above the old one.
+    """
+    cues = sorted(cues, key=lambda cue: (cue[0], cue[1]))
+    trimmed = []
+    for i, (start, end, text) in enumerate(cues):
+        if i + 1 < len(cues) and end > cues[i + 1][0]:
+            end = cues[i + 1][0]
+        if end <= start:
+            end = start + 0.05
+            if i + 1 < len(cues):
+                end = min(end, cues[i + 1][0])
+        if end <= start or not text:
+            continue
+        trimmed.append((start, end, text))
+    return trimmed
+
+
+def cues_to_srt(cues):
+    segments = []
+    for index, (start, end, text) in enumerate(trim_cue_ends(cues), start=1):
+        segments.append(f"{index}\n{_srt_time(start)} --> {_srt_time(end)}\n{text}\n")
+    return "\n".join(segments).strip()
+
+
+def cues_to_vtt(cues):
+    lines = ["WEBVTT", ""]
+    for start, end, text in trim_cue_ends(cues):
+        lines.append(f"{_vtt_time(start)} --> {_vtt_time(end)}")
+        lines.append(text)
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def parse_caption_cues(text):
+    """Read cues from an SRT or WebVTT file. Returns (start, end, text) in seconds."""
+    cues = []
+    for block in text.replace("\r\n", "\n").replace("\r", "\n").split("\n\n"):
+        lines = [line for line in block.split("\n") if line.strip() and line.strip() != "WEBVTT"]
+        timing = next((i for i, line in enumerate(lines) if "-->" in line), None)
+        if timing is None:
+            continue
+        start_raw, end_raw = lines[timing].split("-->", 1)
+        text = "\n".join(lines[timing + 1:]).strip()
+        if not text:
+            continue
+        cues.append((_parse_timestamp(start_raw), _parse_timestamp(end_raw.split()[0]), text))
+    return cues
+
+
+def _english_caption_rank(code):
+    """Lower is a better English track. None means this track is not English."""
+    raw = (code or "").lower().replace("_", "-")
+    if raw.startswith("a."):
+        raw = raw[2:]
+    base = raw[:-5] if raw.endswith("-orig") else raw
+    if base != "en" and not base.startswith("en-") and not base.startswith("en."):
+        return None
+    if raw == "en-orig":
+        return 0
+    if base == "en":
+        return 1
+    if base in ("en-us", "en-gb"):
+        return 2
+    return 3
+
+
 def _require_single_video(info):
     kind = info.get("_type") or "video"
     if kind != "video":
@@ -163,9 +250,12 @@ def _require_single_video(info):
 
 
 def srv1_to_srt(xml_captions):
-    """Convert YouTube's srv1 caption xml (<transcript><text start= dur=>) to SRT."""
+    """Convert YouTube's srv1 caption xml (<transcript><text start= dur=>) to SRT.
+
+    Cue ends are trimmed to the next cue's start so only the current line is on screen.
+    """
     root = ElementTree.fromstring(xml_captions)
-    segments = []
+    cues = []
     for el in root.iter("text"):
         # srv1 text is html-escaped inside the xml escaping (e.g. &amp;#39;)
         text = unescape("".join(el.itertext())).replace("\n", " ").strip()
@@ -173,8 +263,8 @@ def srv1_to_srt(xml_captions):
             continue
         start = float(el.get("start", 0))
         end = start + float(el.get("dur", 0))
-        segments.append(f"{len(segments) + 1}\n{_srt_time(start)} --> {_srt_time(end)}\n{text}\n")
-    return "\n".join(segments).strip()
+        cues.append((start, end, text))
+    return cues_to_srt(cues)
 
 
 class YTCaption:
@@ -277,22 +367,33 @@ class YTVideo:
         # hqdefault exists for every video
         return f"https://i.ytimg.com/vi/{self.video_id}/hqdefault.jpg"
 
+    def _best_english_key(self, tracks):
+        best_key = None
+        best_rank = None
+        for key in tracks or {}:
+            if key == "live_chat":
+                continue
+            rank = _english_caption_rank(key)
+            if rank is None:
+                continue
+            if best_key is None or (rank, key.lower()) < (best_rank, best_key.lower()):
+                best_key = key
+                best_rank = rank
+        return best_key
+
     @property
     def captions(self):
-        """Uploaded caption tracks plus the auto-generated track in the video's own language
-        (code "a.<lang>", same as pytubefix). Auto-translated tracks are skipped."""
-        tracks = []
-        for lang, formats in (self.info.get("subtitles") or {}).items():
-            if lang == "live_chat":
-                continue
-            tracks.append(YTCaption(self, lang, formats))
+        """The English track only, saved as "en".
 
+        An uploaded English track wins. Otherwise the auto-generated English track.
+        Other languages are not returned.
+        """
+        manual = self.info.get("subtitles") or {}
+        key = self._best_english_key(manual)
+        if key:
+            return [YTCaption(self, "en", manual[key])]
         auto = self.info.get("automatic_captions") or {}
-        orig = [k for k in auto if k.endswith("-orig")]
-        if orig:
-            for k in orig:
-                tracks.append(YTCaption(self, "a." + k[:-len("-orig")], auto[k]))
-        elif self.info.get("language") in auto:
-            lang = self.info["language"]
-            tracks.append(YTCaption(self, "a." + lang, auto[lang]))
-        return tracks
+        key = self._best_english_key(auto)
+        if key:
+            return [YTCaption(self, "en", auto[key])]
+        return []

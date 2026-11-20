@@ -1,0 +1,19 @@
+/* The control bar is 3em. Keep the current caption line above it, with a
+   small gap, and drop the line back down after the bar fades out. */
+.video-js .vjs-text-track-display {
+  bottom: 5em;
+  transition: bottom 0.1s;
+}
+
+.video-js.vjs-user-inactive.vjs-playing .vjs-text-track-display {
+  bottom: 1.5em;
+  transition: bottom 1s;
+}
+
+.video-js video::-webkit-media-text-track-display {
+  transform: translateY(-5em);
+}
+
+.video-js.vjs-user-inactive.vjs-playing video::-webkit-media-text-track-display {
+  transform: translateY(-1.5em);
+}

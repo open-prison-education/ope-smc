@@ -40,6 +40,7 @@ $(function() {
 	}
 
 	var yt_busy_timer = null;
+	var yt_reload_on_error = false;
 
 	function ShowYTBusy(msg) {
 		var started = Date.now();
@@ -70,18 +71,24 @@ $(function() {
 		btn.prop('disabled', true).addClass('disabled');
 		form.find('input[type=text], textarea').not('[readonly]').prop('readonly', true).addClass('yt_locked');
 		form.find('.yt_cancel').hide();
+		yt_reload_on_error = true;
 		ShowYTBusy(btn.data('busy_msg') || 'Working...');
 	});
 
 	$(document).on('w2p:componentComplete', function(e, xhr, status) {
 		if (!e.containerTarget || e.containerTarget.id !== 'yt_step') { return; }
 		HideYTBusy();
-		if (status !== 'success' && status !== 'notmodified') {
-			$('#yt_error').text('Something went wrong talking to the server (' + xhr.status + ' ' +
-				(xhr.statusText || status) + '). Please try again.').show();
-			$('#yt_step input.yt_submit').prop('disabled', false).removeClass('disabled');
-			$('#yt_step .yt_locked').prop('readonly', false).removeClass('yt_locked');
-			$('#yt_step .yt_cancel').show();
+		if (status === 'success' || status === 'notmodified') {
+			yt_reload_on_error = false;
+			return;
+		}
+		// updatePage has already replaced the form with the error body, so there is
+		// nothing left to re-enable. Load a fresh step 1 form once.
+		$('#yt_error').text('Something went wrong talking to the server (' + xhr.status + ' ' +
+			(xhr.statusText || status) + '). Please try again.').show();
+		if (yt_reload_on_error) {
+			yt_reload_on_error = false;
+			web2py_component("{{=URL('media', 'pull_from_youtube_step_1.load', user_signature=True)}}", "yt_step");
 		}
 	});
 </script>

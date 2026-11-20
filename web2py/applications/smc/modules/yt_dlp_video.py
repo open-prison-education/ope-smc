@@ -11,10 +11,13 @@ Runtime requirements:
     dependency) bundles a suitable node and is used if present.
   - bgutil-ytdlp-pot-provider plugin plus its HTTP server (YT_POT_PROVIDER_URL) for PO tokens.
     Without it, stream downloads get HTTP 403 from YouTube.
-  - ffmpeg on the PATH for videos that only have separate video/audio streams.
+  - ffmpeg (passed in by the scheduler via find_ffmpeg, else on the PATH) when video and audio
+    are separate streams.
 """
 import copy
 import os
+import time
+import urllib.request
 import xml.etree.ElementTree as ElementTree
 from html import unescape
 
@@ -23,9 +26,13 @@ from yt_dlp.networking import HEADRequest
 
 POT_PROVIDER_URL = os.environ.get("YT_POT_PROVIDER_URL", "http://127.0.0.1:4416")
 
-# Single file 360p mp4 first (no merge needed), then 480p h264 + aac merged by ffmpeg.
+# Single file 360p mp4 first (no merge needed), then 480p h264 + aac merged by ffmpeg,
+# then any single mp4 at 480p or below. A higher mp4 is only used when nothing <=480 exists.
 # Stick to h264/aac so the result plays in every browser.
-VIDEO_FORMAT = "18/bv*[ext=mp4][vcodec^=avc1][height<=480]+ba[ext=m4a]/b[ext=mp4]"
+VIDEO_FORMAT = (
+    "18/bv*[ext=mp4][vcodec^=avc1][height<=480]+ba[ext=m4a]"
+    "/b[ext=mp4][height<=480]/b[ext=mp4]"
+)
 
 RATE_LIMIT_MARKERS = ("http error 429", "too many requests", "try again later")
 BOT_MARKERS = ("not a bot",)
@@ -39,10 +46,12 @@ FORBIDDEN_MARKERS = ("http error 403",)
 PERMANENT_MARKERS = (
     "private video", "video unavailable", "this video is unavailable", "has been removed",
     "members-only", "join this channel", "confirm your age", "age-restricted",
-    "inappropriate for some users", "this live event will begin", "premieres in",
-    "is not a valid url", "unsupported url", "incomplete youtube id",
+    "inappropriate for some users",
+    "is not a valid url", "unsupported url", "incomplete youtube id", "no suitable extractor",
     "account associated with this video has been terminated", "live stream",
 )
+# Not aired yet. The video itself will become downloadable, so this is retried later.
+UPCOMING_MARKERS = ("this live event will begin", "premieres in")
 
 
 class YTVideoError(Exception):
@@ -52,10 +61,12 @@ class YTVideoError(Exception):
 
 
 def classify_error(ex):
-    """Returns one of: rate_limited, bot, region, proxy, forbidden, permanent, unknown.
+    """Returns one of: rate_limited, bot, region, proxy, forbidden, permanent, unavailable_now, unknown.
 
-    rate_limited/bot/region/proxy/forbidden are problems with the proxy (try another one),
-    permanent means no proxy will help, unknown means give up for now and try again later.
+    rate_limited/bot/proxy/forbidden are problems with the proxy (try another one).
+    region and permanent are about the video: stop, and do not mark the proxy.
+    unavailable_now (live, premiere) will not work on any proxy today, but should be retried later.
+    unknown means stop this run and try again later, without burning the rest of the proxy list.
     """
     if isinstance(ex, YTVideoError):
         return ex.kind
@@ -66,6 +77,7 @@ def classify_error(ex):
         ("region", REGION_MARKERS),
         ("proxy", PROXY_MARKERS),
         ("forbidden", FORBIDDEN_MARKERS),
+        ("unavailable_now", UPCOMING_MARKERS),
         ("permanent", PERMANENT_MARKERS),
     ):
         if any(m in msg for m in markers):
@@ -73,11 +85,42 @@ def classify_error(ex):
     return "unknown"
 
 
+_pot_checked = {"at": 0.0, "ok": False}
+
+
+def pot_provider_reachable(timeout=3):
+    """True when the bgutil PO-token server answers GET /ping. Cached for 60s.
+
+    A 403 while this is down is the missing token, not a bad proxy. Callers must not
+    mark the proxy FAILED in that case or the whole pool gets backed off.
+    """
+    now = time.time()
+    if now - _pot_checked["at"] < 60:
+        return _pot_checked["ok"]
+    ok = False
+    try:
+        req = urllib.request.Request(POT_PROVIDER_URL.rstrip("/") + "/ping")
+        # Empty ProxyHandler so a process-global opener or HTTP_PROXY cannot hide a local server.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=timeout) as resp:
+            ok = 200 <= getattr(resp, "status", 200) < 300
+    except Exception:
+        ok = False
+    _pot_checked["at"] = now
+    _pot_checked["ok"] = ok
+    return ok
+
+
 def _js_runtimes():
     runtimes = {"deno": {}}
     try:
         import nodejs_wheel.executable
-        runtimes["node"] = {"path": os.path.join(nodejs_wheel.executable.ROOT_DIR, "bin", "node")}
+        root = nodejs_wheel.executable.ROOT_DIR
+        # nodejs-wheel puts node.exe in ROOT_DIR on Windows and bin/node everywhere else.
+        name = "node.exe" if os.name == "nt" else "node"
+        bin_dir = root if os.name == "nt" else os.path.join(root, "bin")
+        node_path = os.path.join(bin_dir, name)
+        runtimes["node"] = {"path": node_path} if os.path.isfile(node_path) else {}
     except ImportError:
         runtimes["node"] = {}
     return runtimes
@@ -90,6 +133,9 @@ def _base_params(proxy):
         "quiet": True,
         "noprogress": True,
         "noplaylist": True,
+        # The video extractor only. Playlists, channels, and non-YouTube URLs are rejected
+        # instead of being fully extracted (noplaylist does not cover a playlist or channel URL).
+        "allowed_extractors": ["^youtube$"],
         "format": VIDEO_FORMAT,
         "js_runtimes": _js_runtimes(),
         # Only used if the yt-dlp-ejs package is missing
@@ -107,6 +153,13 @@ def _srt_time(seconds):
     m, ms = divmod(ms, 60000)
     s, ms = divmod(ms, 1000)
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+
+def _require_single_video(info):
+    kind = info.get("_type") or "video"
+    if kind != "video":
+        raise YTVideoError(
+            f"Only a single YouTube video can be pulled (got {kind})", "permanent")
 
 
 def srv1_to_srt(xml_captions):
@@ -146,9 +199,13 @@ class YTStream:
     def __init__(self, video):
         self.video = video
 
-    def download(self, output_path, filename, max_retries=3, timeout=300):
+    def download(self, output_path, filename, max_retries=1, timeout=60, ffmpeg_location=None):
         """Download to output_path/<filename without ext>.mp4 through the same proxy that
-        extracted the info (stream urls are tied to that IP). Returns the file path."""
+        extracted the info (stream urls are tied to that IP). Returns the file path.
+
+        timeout is the per-socket idle timeout, not the whole download. Retries stay low
+        because the caller switches proxies; a dead proxy should not sit here for minutes.
+        """
         base = os.path.splitext(filename)[0]
         params = dict(
             self.video.params,
@@ -160,6 +217,8 @@ class YTStream:
             overwrites=True,
             continuedl=False,
         )
+        if ffmpeg_location:
+            params["ffmpeg_location"] = ffmpeg_location
         with YoutubeDL(params) as ydl:
             ydl.process_ie_result(copy.deepcopy(self.video.info), download=True)
 
@@ -174,18 +233,36 @@ class YTVideo:
         self.proxy = proxy
         self.params = _base_params(proxy)
         with YoutubeDL(self.params) as ydl:
-            self.info = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(url, download=False, process=False)
+            if not info:
+                raise YTVideoError("yt-dlp returned no video info", "unknown")
+            _require_single_video(info)
+            self.info = ydl.process_ie_result(info, download=False)
+            _require_single_video(self.info)
 
-            if self.info.get("is_live"):
-                raise YTVideoError("Video is a live stream - can't download it until it ends", "permanent")
+            live_status = self.info.get("live_status")
+            if self.info.get("is_live") or live_status == "is_live":
+                raise YTVideoError(
+                    "Video is a live stream - can't download it until it ends", "unavailable_now")
+            if live_status == "is_upcoming":
+                raise YTVideoError(
+                    "Video is scheduled and has not aired yet", "unavailable_now")
 
             self.video_id = self.info.get("id")
             self.title = self.info.get("title") or ""
             self.description = self.info.get("description") or ""
-            self.thumbnail_url = self._pick_thumbnail(ydl)
+        # Thumbnail HEAD requests are deferred. The pull form only needs title and description.
+        self._thumbnail_url = None
         height = self.info.get("height")
         self.res = f"{height}p" if height else ""
         self.stream = YTStream(self)
+
+    @property
+    def thumbnail_url(self):
+        if self._thumbnail_url is None:
+            with YoutubeDL(self.params) as ydl:
+                self._thumbnail_url = self._pick_thumbnail(ydl)
+        return self._thumbnail_url
 
     def _pick_thumbnail(self, ydl):
         # Prefer jpg - thumbnails get saved as-is and the webp ones confuse older players.

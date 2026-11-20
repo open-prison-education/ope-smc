@@ -26,7 +26,8 @@ export LISTEN_IP="::"
 export W_SSL=1
 export SSL_CERT="test.crt"
 export SSL_KEY="test.key"
-export W_SCHEDULER="-K smc --with-scheduler"
+# youtube_queue runs in its own process so a long download does not block the other tasks.
+export W_SCHEDULER="-K smc:process_videos:create_home_directory:wamap_delete:wamap_videos:misc:download_videos --with-scheduler"
 
 
 echo ${ESC_GREEN}Removing PYC files...${ESC_RESET}
@@ -40,6 +41,16 @@ rm -f kill_smc.bat
 
 # DEV PORT
 DEV_PORT=7999
+
+echo ${ESC_GREEN}Starting YouTube scheduler...${ESC_RESET}
+$PYEXE -B web2py/web2py.py -K smc:youtube_queue >>/tmp/smc-youtube-scheduler.log 2>&1 &
+YT_SCHED_PID=$!
+cleanup_youtube_scheduler() {
+    if [ -n "$YT_SCHED_PID" ]; then
+        kill "$YT_SCHED_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup_youtube_scheduler EXIT INT TERM
 
 if [ "$W_SSL" == "1" ]; then
     echo ${ESC_GREEN}Starting Web2Py w SSL...${ESC_RESET}

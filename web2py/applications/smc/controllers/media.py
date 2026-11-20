@@ -1887,7 +1887,10 @@ def pull_from_youtube_step_1():
                                                  _style="width: 600px;", _placeholder="https://www.youtube.com/watch?v=...")),
                       TR("", INPUT(_type="submit", _value="Next", _class="yt_submit",
                                    data=dict(w2p_disable="true", busy_msg="Looking up video on YouTube...")))),
-                keepvalues=True, _name="yt_step1")
+                keepvalues=True, _name="yt_step1",
+                # Explicit action. Otherwise web2py reuses the previous component URL, and the
+                # next submit after step 2 posts straight to step 2, skipping this check.
+                _action=URL('media', 'pull_from_youtube_step_1.load', user_signature=True))
 
     if form.process(formname="yt_step1").accepted:
         yt_url = form.vars.yt_url

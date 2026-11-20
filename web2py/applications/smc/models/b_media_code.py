@@ -153,8 +153,13 @@ def get_youtube_proxies(verify=True, max_proxies=3):
     Bad proxies not due for a re-check are skipped.
 
     With verify, OK proxies get a quick alive check and the others get the full health probe
-    (both in parallel) before being returned, so a proxy that went bad costs seconds, not a
-    failed download attempt. Results are saved via record_proxy_result.
+    (both in parallel, and only until max_proxies pass) before being returned. Results are
+    saved via record_proxy_result.
+
+    If this machine cannot reach YouTube, nothing is recorded: an outage is not a dead proxy.
+    Proxies whose scheme urllib cannot probe (socks, https) are returned without a probe.
+    If every proxy is still in backoff, the least recently failed ones are returned so the
+    caller does not fall through to a direct connection.
     """
     now = datetime.datetime.now()
     never = datetime.datetime.min
@@ -168,30 +173,61 @@ def get_youtube_proxies(verify=True, max_proxies=3):
                            and (r.next_check_on is None or r.next_check_on <= now)],
                           key=lambda r: r.next_check_on or never)
 
-    ret = [r.proxy_url for r in ok_rows]
-    if verify:
-        alive = yt_proxy_health.check_alive_many(ret)
-        for url, (ok, msg) in alive.items():
-            if not ok:
-                print(f"YouTube proxy failed alive check: {urlparse(url).hostname}:{urlparse(url).port} {msg}")
-                record_proxy_result(url, yt_proxy_health.DEAD, msg)
-        ret = [url for url in ret if alive[url][0]]
+    backed_off = sorted(
+        [r for r in rows if r.status in yt_proxy_health.BAD_STATUSES
+         and r.next_check_on is not None and r.next_check_on > now],
+        key=lambda r: r.last_error_on or never)
 
-    others = [r.proxy_url for r in unknown_rows + due_bad_rows]
-    while len(ret) < max_proxies and others:
-        batch, others = others[:10], others[10:]
-        if not verify:
-            ret.extend(batch)
-            continue
-        results = yt_proxy_health.probe_many(batch)
-        for url in batch:
-            status, msg = results[url]
-            record_proxy_result(url, status, msg)
-            # UNKNOWN means the probe got an unexpected answer - let a real request decide
-            if status in (yt_proxy_health.OK, yt_proxy_health.UNKNOWN):
-                ret.append(url)
+    # An offline machine fails every probe. Recording those failures walks every proxy
+    # up to the 6h backoff, and the next online pull then goes out with no proxy.
+    online = (not verify) or yt_proxy_health.youtube_reachable()
+    if verify and not online:
+        print("YouTube is not reachable from this machine. Skipping proxy health checks.")
+
+    ret = []
+
+    def take(urls, full_probe):
+        pending = list(urls)
+        while len(ret) < max_proxies and pending:
+            batch, pending = pending[:10], pending[10:]
+            probe_urls = [u for u in batch if yt_proxy_health.urllib_can_probe(u)] if (verify and online) else []
+            if full_probe and probe_urls:
+                results = yt_proxy_health.probe_many(probe_urls)
+            elif probe_urls:
+                results = yt_proxy_health.check_alive_many(probe_urls)
             else:
-                print(f"YouTube proxy failed health check: {urlparse(url).hostname}:{urlparse(url).port} {status} {msg}")
+                results = {}
+            for url in batch:
+                if url not in results:
+                    # Not probed: verification is off, we are offline, or urllib cannot speak this scheme.
+                    ret.append(url)
+                elif full_probe:
+                    status, msg = results[url]
+                    record_proxy_result(url, status, msg)
+                    if status in (yt_proxy_health.OK, yt_proxy_health.UNKNOWN):
+                        ret.append(url)
+                    else:
+                        parsed = urlparse(url)
+                        print(f"YouTube proxy failed health check: {parsed.hostname}:{parsed.port} {status} {msg}")
+                else:
+                    ok, msg = results[url]
+                    if ok:
+                        ret.append(url)
+                    else:
+                        parsed = urlparse(url)
+                        print(f"YouTube proxy failed alive check: {parsed.hostname}:{parsed.port} {msg}")
+                        record_proxy_result(url, yt_proxy_health.DEAD, msg)
+                if len(ret) >= max_proxies:
+                    return
+
+    # Alive-check OK proxies in batches and stop once we have enough, instead of
+    # checking the whole pool on every lookup.
+    take([r.proxy_url for r in ok_rows], full_probe=False)
+    take([r.proxy_url for r in unknown_rows + due_bad_rows], full_probe=True)
+
+    if not ret and backed_off:
+        print("All YouTube proxies are in backoff. Using the least recently failed one instead of a direct connection.")
+        ret = [r.proxy_url for r in backed_off[:max_proxies]]
 
     return ret[:max_proxies]
 

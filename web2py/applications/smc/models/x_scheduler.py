@@ -135,7 +135,7 @@ import multiprocessing
 #from pytube import YouTube
 from pytubefix import YouTube
 #from applications.smc.modules.pytube import YouTube
-from yt_dlp_video import YTVideo, classify_error
+from yt_dlp_video import YTVideo, classify_error, pot_provider_reachable, POT_PROVIDER_URL
 import yt_proxy_health
 
 from ednet.ad import AD
@@ -336,6 +336,31 @@ PROXY_ERROR_STATUS = {
 }
 # Proxies to try per run when the video download (not just the lookup) fails on a proxy
 MAX_DOWNLOAD_ATTEMPTS = 3
+# Stop retrying a video after this many failed runs, so an unknown yt-dlp error
+# cannot be retried forever. Live and not-yet-aired videos do not count toward this.
+MAX_DOWNLOAD_FAILURES = 5
+
+
+def record_download_failure(media_file, keep_trying, captions_only=False):
+    """Increment download_failures by exactly 1. After MAX_DOWNLOAD_FAILURES, stop retrying.
+
+    Only the fields passed here are written, so a stale in-memory download_log is not saved.
+    """
+    failures = (media_file.download_failures or 0) + 1
+    give_up = (not keep_trying) or failures >= MAX_DOWNLOAD_FAILURES
+    if keep_trying and failures >= MAX_DOWNLOAD_FAILURES:
+        msg = f"Stopping after {failures} failed attempts."
+        print(msg)
+        log_to_video(media_file, msg)
+    fields = dict(download_failures=failures)
+    if captions_only:
+        fields["needs_caption_downloading"] = not give_up
+    else:
+        fields["needs_downloading"] = not give_up
+        if give_up:
+            fields["needs_caption_downloading"] = False
+    media_file.update_record(**fields)
+    db.commit()
 
 def find_best_yt_stream(yt_url, media_file=None):
     yt = None
@@ -379,25 +404,10 @@ def find_best_yt_stream(yt_url, media_file=None):
         try:
             if proxy is not None:
                 msg = f"Trying to get {yt_url} from proxy {hostname}:{port}"
-                # Youtube proxy wants it in p['https']='https://123.123.321.321:35000' form
-                p = {
-                    'https': proxy,
-                    'http': proxy,
-                }
             else:
                 msg = f"Trying to get {yt_url} without proxy (no reachable proxy in pool)"
-                p = None
             print(msg)
             log_to_video(media_file, msg)
-
-            # Thumbnail downloads use urlopen, so point the process-global opener at the same proxy.
-            try:
-                if p is not None:
-                    install_opener(build_opener(ProxyHandler(p)))
-                else:
-                    install_opener(build_opener(ProxyHandler({})))
-            except Exception as ex:
-                print("Warning: could not reset urllib opener: %s" % (ex,))
 
             yt = YTVideo(yt_url_tmp, proxy=proxy)
             stream = yt.stream
@@ -409,33 +419,69 @@ def find_best_yt_stream(yt_url, media_file=None):
 
         except Exception as ex:
             kind = classify_error(ex)
-            if kind in PROXY_ERROR_STATUS or kind == "region":
-                # Problem with this proxy - mark it so it gets skipped until its next health check.
-                # Region blocks are about the video, not the proxy, so they don't count against it.
-                status = PROXY_ERROR_STATUS.get(kind)
+            detail = f"{yt_url} (proxy={hostname}:{port}) -- {ex}"
+
+            if kind in ("region", "permanent"):
+                # Region is a property of the video, not this proxy. Do not mark the proxy
+                # and do not try the next one.
+                if kind == "region":
+                    msg = f"Error grabbing YT video - not available in this region. {detail}"
+                else:
+                    msg = (
+                        "Error grabbing YT video - Video not available or blocked - check to see if the "
+                        f"url is correct, that it isn't private, that it is available in your region, etc... {detail}"
+                    )
+                session.yt_urls_error_msg += msg
+                print(msg)
+                log_to_video(media_file, msg)
+                return None, None, res, "Permanent Error"
+
+            if kind == "unavailable_now":
+                # Live or not aired yet. Retrying other proxies will not help; a later run might.
+                msg = f"YouTube video is not downloadable yet. Will try again later. {detail}"
+                session.yt_urls_error_msg += msg
+                print(msg)
+                log_to_video(media_file, msg)
+                # Not a failure of this proxy or of the URL. Kept out of download_failures
+                # so a premiere next week is still picked up after it airs.
+                return None, None, res, "Not Ready"
+
+            if kind == "forbidden" and not pot_provider_reachable():
+                # A missing PO token 403s every proxy. Marking them FAILED walks the pool
+                # up to a 6h backoff and the next pull goes out direct.
+                msg = (
+                    f"YouTube returned 403 and the PO token provider at {POT_PROVIDER_URL} "
+                    f"is not responding. Not marking proxies failed. {detail}"
+                )
+                session.yt_urls_error_msg += msg
+                print(msg)
+                log_to_video(media_file, msg)
+                return None, None, res, "Temporary Error"
+
+            if kind in PROXY_ERROR_STATUS:
+                status = PROXY_ERROR_STATUS[kind]
                 if proxy is not None and status:
                     record_proxy_result(proxy, status, str(ex))
-                msg = f"YouTube {kind} error on {yt_url} (proxy={hostname}:{port}) -- {ex}. "
+                msg = f"YouTube {kind} error on {detail}. "
                 session.yt_urls_error_msg += msg
                 print(msg)
                 log_to_video(media_file, msg)
                 yt = stream = None
                 continue
 
-            if kind == "permanent":
-                msg = f"Error grabbing YT video - Video not available or blocked - check to see if the url is correct, that it isn't private, that it is available in your region, etc... {yt_url} -- {ex}"
-                session.yt_urls_error_msg += msg
-                print(msg)
-                log_to_video(media_file, msg)
-                return None, None, res, "Permanent Error"
-
-            msg = f"Error grabbing YT video - yt-dlp error - YouTube might have changed something, update yt-dlp if this keeps happening: {yt_url} (proxy={hostname}:{port}) -- {ex}"
+            # Unknown: stop this run. Trying every remaining proxy just multiplies a
+            # broken extractor or a missing ffmpeg across the pool.
+            msg = (
+                "Error grabbing YT video - yt-dlp error - YouTube might have changed something, "
+                f"update yt-dlp if this keeps happening: {detail}"
+            )
             session.yt_urls_error_msg += msg
             print(msg)
             traceback.print_exc()
             log_to_video(media_file, msg)
             yt = stream = None
-    
+            break
+
     # If getting here, we didn't find a good one, try again later!
     return_code = "Temporary Error"
     return yt, stream, res, return_code
@@ -556,18 +602,11 @@ def process_wamap_video_links():
                     f.write(meta_json)
                     f.close()
 
-                    # Download the video from the internet
-                    yt = YouTube(proxies=get_youtube_proxies())
-                    yt_url = yt_url.replace("!!1", "").replace("!!0", "")  # because some urls end up with the
-                    # field separator still in it
-                    if "/embed/" in yt_url:
-                        # Embedded link doesn't return correctly, change it back
-                        # to normal link
-                        yt_url = yt_url.replace("/embed/", "/watch?v=")
-                    yt.url = yt_url
-                    yt.filename = "wamap_" + str(item.media_guid)
-                    f = yt.filter('mp4')[-1]
-                    f.download()                    
+                    # pytubefix does not implement YouTube(proxies=list) / .url / .filter().
+                    # This path stays on pytubefix on purpose. Don't health-check the proxy
+                    # pool on the way into that TypeError.
+                    print(" ****** WAMAP YouTube import is not supported by pytubefix; skipped ****** ")
+                    had_errors = True                    
                 except Exception as e:
                     print(" ****** Error fetching movie ****** " + str(e))
                     had_errors = True
@@ -1121,10 +1160,8 @@ def process_youtube_queue(run_from=""):
                     db.commit()
                 except Exception as ex:
                     # Had issues downloading from youtube.
-                    next_row.update_record(download_failures=(next_row.download_failures or 0) + 1)
-                    # if next_row.download_failures > 5:
-                    #     next_row.needs_downloading = False
-                    db.commit()
+                    print(f"process_youtube_queue failed: {ex}")
+                    record_download_failure(next_row, keep_trying=True)
         else:
             print("All caught up, no videos needed downloading.")
 
@@ -1137,13 +1174,21 @@ def process_youtube_queue(run_from=""):
 def check_youtube_proxies(run_from=""):
     # Health check proxies that are due: never checked, OK and not used/checked in 30 min,
     # or bad and past their backoff (dead/flagged ports do come back).
+    if not yt_proxy_health.youtube_reachable():
+        print("YouTube is not reachable from this machine. Not updating proxy health.")
+        time.sleep(2)
+        return True
     now = datetime.datetime.now()
     rows = db(
         (db.youtube_proxy_list.enabled == True) &
         ((db.youtube_proxy_list.next_check_on == None) | (db.youtube_proxy_list.next_check_on <= now))
     ).select()
-    print(f"Checking {len(rows)} YouTube proxies...")
-    results = yt_proxy_health.probe_many([r.proxy_url for r in rows])
+    probe_rows = [r for r in rows if yt_proxy_health.urllib_can_probe(r.proxy_url)]
+    skipped = len(rows) - len(probe_rows)
+    print(f"Checking {len(probe_rows)} YouTube proxies...")
+    if skipped:
+        print(f"Skipping {skipped} proxies whose scheme urllib cannot probe (socks or https).")
+    results = yt_proxy_health.probe_many([r.proxy_url for r in probe_rows])
     for url, (status, msg) in results.items():
         record_proxy_result(url, status, msg)
 
@@ -1310,21 +1355,17 @@ def pull_youtube_video(media_file, force_video=False, force_captions=False):
                 if return_code == "Permanent Error":
                     print(f"Permanent Error - Unable to get video {yt_url}.")
                     log_to_video(media_file, f"Failed to download video from {yt_url}, will stop trying.")
-                    # Only pass the changed fields - a bare update_record() would write the stale download_log back
-                    media_file.update_record(
-                        needs_downloading=False,
-                        needs_caption_downloading=False,
-                        download_failures=(media_file.download_failures or 0) + 1,
-                    )
-                    db.commit()
+                    record_download_failure(media_file, keep_trying=False)
                     return True
                 elif return_code == "Temporary Error":
                     print(f"Temporary Error - Unable to get video {yt_url}.")
                     log_to_video(media_file, f"Failed to download video from {yt_url}, will keep trying.")
-                    media_file.update_record(
-                        needs_downloading=True,
-                        download_failures=(media_file.download_failures or 0) + 1,
-                    )
+                    record_download_failure(media_file, keep_trying=True)
+                    return True
+                elif return_code == "Not Ready":
+                    print(f"Video is not ready yet {yt_url}.")
+                    log_to_video(media_file, f"Video is live or has not aired yet: {yt_url}. Will keep trying.")
+                    media_file.update_record(needs_downloading=True)
                     db.commit()
                     return True
                 elif return_code == "OK":
@@ -1332,11 +1373,7 @@ def pull_youtube_video(media_file, force_video=False, force_captions=False):
             except Exception as ex:
                 print(f"Unknown HTTP error pulling yt video? {yt_url}\n{ex}")
                 log_to_video(media_file, f"Unknown Error - Failed to download video from {yt_url}, will keep trying.\n{ex}")
-                media_file.update_record(
-                    needs_downloading=True,
-                    download_failures=(media_file.download_failures or 0) + 1,
-                )
-                db.commit()
+                record_download_failure(media_file, keep_trying=True)
                 return False
 
             try:
@@ -1344,7 +1381,10 @@ def pull_youtube_video(media_file, force_video=False, force_captions=False):
                 print(msg)
                 log_to_video(media_file, msg)
 
-                stream.download(output_path=target_folder, filename=output_mp4_filename, max_retries=3, timeout=300)  # put in folder name
+                # One try per proxy. The loop below switches proxies. ffmpeg_location covers
+                # the Windows install that is not on PATH.
+                stream.download(output_path=target_folder, filename=output_mp4_filename,
+                                max_retries=1, timeout=60, ffmpeg_location=ffmpeg)
 
                 msg = f"Download Complete!"
                 print(msg)
@@ -1356,7 +1396,17 @@ def pull_youtube_video(media_file, force_video=False, force_captions=False):
             except Exception as ex:
                 # The lookup worked but the video servers refused this proxy (e.g. 403) - it is
                 # now marked bad, so find_best_yt_stream will pick the next proxy.
-                status = PROXY_ERROR_STATUS.get(classify_error(ex))
+                kind = classify_error(ex)
+                if kind == "forbidden" and not pot_provider_reachable():
+                    msg = (
+                        f"Download got 403 and the PO token provider at {POT_PROVIDER_URL} "
+                        f"is not responding. Not marking proxies failed. {ex}"
+                    )
+                    print(msg)
+                    log_to_video(media_file, msg)
+                    record_download_failure(media_file, keep_trying=True)
+                    return False
+                status = PROXY_ERROR_STATUS.get(kind)
                 if yt.proxy is not None and status:
                     record_proxy_result(yt.proxy, status, f"Download failed: {ex}")
                     if attempt < MAX_DOWNLOAD_ATTEMPTS:
@@ -1369,11 +1419,7 @@ def pull_youtube_video(media_file, force_video=False, force_captions=False):
                 msg = f"Error Downloading YouTube Video! Will try again later. {ex}"
                 print(msg)
                 log_to_video(media_file, msg)
-                media_file.update_record(
-                    needs_downloading=True,
-                    download_failures=(media_file.download_failures or 0) + 1,
-                )
-                db.commit()
+                record_download_failure(media_file, keep_trying=True)
                 return False
 
         # print("TN File: " + output_thumb)
@@ -1387,9 +1433,12 @@ def pull_youtube_video(media_file, force_video=False, force_captions=False):
         # Download the thumbnail file if its set
         if thumbnail_url != "":
             try:
-                tn = urlopen(thumbnail_url)
+                # Same proxy as the video. A process-global opener would also send later
+                # urllib calls in this process (including other requests) through that proxy.
+                with yt_proxy_health.urlopen_through_proxy(thumbnail_url, yt.proxy) as tn:
+                    tn_bytes = tn.read()
                 with open(output_thumb, 'wb') as f:
-                    f.write(tn.read())
+                    f.write(tn_bytes)
                 # Copy the thumbnail to the poster
                 shutil.copy(output_thumb, output_poster)
             except Exception as ex:
@@ -1431,15 +1480,15 @@ def pull_youtube_video(media_file, force_video=False, force_captions=False):
                 except Exception as ex:
                     log_to_video(media_file, f"Error generating poster: {output_poster} - {ex}")
 
-        # Update media file to show it has been downloaded
-        title = yt.title
-        description = yt.description
-
-        db(db.media_files.media_guid==media_file.media_guid).update(
-            needs_downloading = False,
-            title = title,
-            description = description,
-        )
+        # Keep a title or description the user typed on the pull form. Only fill the
+        # placeholder written by queue_up_yt_video, or a description that is still empty.
+        fields = dict(needs_downloading=False)
+        title = media_file.title or ""
+        if (not title) or title.startswith("Downloading from:"):
+            fields["title"] = yt.title
+        if not media_file.description:
+            fields["description"] = yt.description
+        db(db.media_files.media_guid==media_file.media_guid).update(**fields)
         db.commit()
 
         save_media_file_json(media_file.media_guid)
@@ -1456,19 +1505,17 @@ def pull_youtube_video(media_file, force_video=False, force_captions=False):
                 if return_code == "Permanent Error":
                     print(f"Permanent Error - Unable to get captions {yt_url}.")
                     log_to_video(media_file, f"Failed to download captions from {yt_url}, will stop trying.")
-                    media_file.update_record(
-                        needs_caption_downloading=False,
-                        download_failures=(media_file.download_failures or 0) + 1,
-                    )
-                    db.commit()                
+                    record_download_failure(media_file, keep_trying=False, captions_only=True)
                     return True
                 elif return_code == "Temporary Error":
                     print(f"Temporary Error - Unable to get captions {yt_url}.")
                     log_to_video(media_file, f"Failed to download captions from {yt_url}, will keep trying.")
-                    media_file.update_record(
-                        needs_caption_downloading=True,
-                        download_failures=(media_file.download_failures or 0) + 1,
-                    )
+                    record_download_failure(media_file, keep_trying=True, captions_only=True)
+                    return True
+                elif return_code == "Not Ready":
+                    print(f"Captions are not ready yet {yt_url}.")
+                    log_to_video(media_file, f"Video is live or has not aired yet: {yt_url}. Will keep trying captions.")
+                    media_file.update_record(needs_caption_downloading=True)
                     db.commit()
                     return True
                 elif return_code == "OK":
@@ -1476,11 +1523,7 @@ def pull_youtube_video(media_file, force_video=False, force_captions=False):
         except Exception as ex:
             print(f"Unknown HTTP error pulling yt captions? {yt_url}\n{ex}")
             log_to_video(media_file, f"Unknown Error - Failed to download captions from {yt_url}, will keep trying.\n{ex}")
-            media_file.update_record(
-                needs_caption_downloading=True,
-                download_failures=(media_file.download_failures or 0) + 1,
-            )
-            db.commit()
+            record_download_failure(media_file, keep_trying=True, captions_only=True)
             return False
 
         # Now we have a list of captions, go get them.
@@ -1666,8 +1709,12 @@ run_maintenance_task(
 
 
 # Make sure we schedule the YouTube queue to process a video every ?? seconds
+# Own worker group so a long download does not block video conversion and the other
+# maintenance tasks. start_smc.sh runs `-K smc:youtube_queue` as a second process and
+# leaves this group off the web server's scheduler.
 run_maintenance_task(
     'process_youtube_queue',
+    group_name="youtube_queue",
     run_delay=300,
     repeats=0,
     repeat_delay=120,
@@ -1675,9 +1722,11 @@ run_maintenance_task(
     kill_if_older_than=3600 # Kill and restart every hour
 )
 
-# Keep youtube_proxy_list health current so downloads go straight to a working proxy
+# Keep youtube_proxy_list health current so downloads go straight to a working proxy.
+# Same worker as the downloads, so a probe never runs beside a download on one database.
 run_maintenance_task(
     'check_youtube_proxies',
+    group_name="youtube_queue",
     run_delay=300,
     repeats=0,
     repeat_delay=300,

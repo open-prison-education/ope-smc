@@ -12,9 +12,11 @@ Two checks, both against YouTube:
 """
 import datetime
 import json
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
 
 # Statuses stored in youtube_proxy_list.status
 OK = "ok"
@@ -43,8 +45,49 @@ def _web_client_context():
         return dict(FALLBACK_WEB_CLIENT)
 
 
+def urllib_can_probe(proxy_url):
+    """urllib speaks http proxies. socks and https-to-the-proxy schemes fail the probe
+    even when yt-dlp can use them, which would mark a working proxy dead."""
+    scheme = (urlparse(proxy_url or "").scheme or "").lower()
+    return scheme in ("http", "")
+
+
 def _opener(proxy_url):
     return urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+
+
+def urlopen_through_proxy(url, proxy_url, timeout=30):
+    """GET url through proxy_url without touching the process-global urllib opener."""
+    if proxy_url and not urllib_can_probe(proxy_url):
+        raise OSError(f"urllib cannot use this proxy scheme: {urlparse(proxy_url).scheme}")
+    if proxy_url:
+        opener = _opener(proxy_url)
+    else:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    return opener.open(req, timeout=timeout)
+
+
+_reach_cache = {"at": 0.0, "ok": False}
+
+
+def youtube_reachable(timeout=5):
+    """Direct generate_204. False means this machine cannot reach YouTube, so a failed
+    proxy probe says nothing about the proxy. Cached for 30s."""
+    now = time.time()
+    if now - _reach_cache["at"] < 30:
+        return _reach_cache["ok"]
+    ok = False
+    req = urllib.request.Request("https://www.youtube.com/generate_204", headers={"User-Agent": USER_AGENT})
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=timeout) as resp:
+            ok = resp.status == 204
+    except Exception:
+        ok = False
+    _reach_cache["at"] = now
+    _reach_cache["ok"] = ok
+    return ok
 
 
 def check_alive(proxy_url, timeout=10):

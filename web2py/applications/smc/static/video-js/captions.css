@@ -1,19 +1,23 @@
-/* The control bar is 3em. Keep the current caption line above it, with a
-   small gap, and drop the line back down after the bar fades out. */
-.video-js .vjs-text-track-display {
-  bottom: 5em;
-  transition: bottom 0.1s;
-}
-
+/* The control bar is 3em. In the normal player the caption sits just above
+   that bar. Fullscreen keeps a larger gap. The offset stays constant:
+   video.js places each cue in pixels and does not move it if this box
+   changes size while a line is on screen. */
+.video-js .vjs-text-track-display,
 .video-js.vjs-user-inactive.vjs-playing .vjs-text-track-display {
-  bottom: 1.5em;
-  transition: bottom 1s;
+  bottom: 3.6em;
 }
 
-.video-js video::-webkit-media-text-track-display {
-  transform: translateY(-5em);
+.video-js.vjs-fullscreen .vjs-text-track-display,
+.video-js.vjs-fullscreen.vjs-user-inactive.vjs-playing .vjs-text-track-display {
+  bottom: 5em;
 }
 
+.video-js video::-webkit-media-text-track-display,
 .video-js.vjs-user-inactive.vjs-playing video::-webkit-media-text-track-display {
-  transform: translateY(-1.5em);
+  transform: translateY(-3.6em);
+}
+
+.video-js.vjs-fullscreen video::-webkit-media-text-track-display,
+.video-js.vjs-fullscreen.vjs-user-inactive.vjs-playing video::-webkit-media-text-track-display {
+  transform: translateY(-5em);
 }

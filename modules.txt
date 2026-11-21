@@ -1,4 +1,4 @@
-requests == 2.25.1  # Needed by streamlink
+requests>=2.32.2  # yt-dlp[default] needs >=2.32. A pin of ==2.25.1 makes pip silently install yt-dlp 2023
 ldap3 # python-ldap
 paramiko
 ecdsa
@@ -36,5 +36,6 @@ jwcrypto
 Pillow
 python-dateutil
 redis
-yt_dlp
+yt-dlp[default]>=2025.11.12
+bgutil-ytdlp-pot-provider  # PO tokens for yt-dlp - needs the brainicism/bgutil-ytdlp-pot-provider server running
 

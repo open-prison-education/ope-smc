@@ -1,3 +1,6 @@
 <div>
+    {{if status_msg:}}
+    <div class="alert {{=status_class}}" style="padding: 6px 12px; margin-bottom: 8px;">{{=status_msg}}</div>
+    {{pass}}
     {{=form1}}
 </div>

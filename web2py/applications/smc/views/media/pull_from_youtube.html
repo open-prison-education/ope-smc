@@ -14,7 +14,7 @@ $(function() {
 		if (click===true) {
 			// Clear the current queue
 			
-			$('#process_queue_view').val("<img src='{{=URL('static', 'images/spinner.gif') }}' />");
+			$('#process_queue_view').html("<img src='{{=URL('static', 'images/spinner.gif') }}' />");
 		}
 
 		if (click===true || $("#auto_refresh").prop("checked") == true) {
@@ -32,6 +32,65 @@ $(function() {
 		web2py_component("{{=URL('media', 'pull_from_youtube_download_queue_current.load', user_signature=True)}}",
                          target="currently_working_on");
 	}
+
+	// Called by the step 1 component (response.js) after a video gets queued
+	function RefreshYTQueue() {
+		GetProcessQueue(true);
+		GetProcessQueueCount();
+	}
+
+	var yt_busy_timer = null;
+	var yt_reload_on_error = false;
+
+	function ShowYTBusy(msg) {
+		var started = Date.now();
+		$('#yt_busy_msg').text(msg);
+		$('#yt_busy_elapsed').text('');
+		$('#yt_busy_hint').hide();
+		$('#yt_error').hide();
+		$('#yt_busy').show();
+		clearInterval(yt_busy_timer);
+		yt_busy_timer = setInterval(function() {
+			var secs = Math.floor((Date.now() - started) / 1000);
+			$('#yt_busy_elapsed').text('(' + secs + 's)');
+			if (secs >= 10) { $('#yt_busy_hint').show(); }
+		}, 1000);
+	}
+
+	function HideYTBusy() {
+		clearInterval(yt_busy_timer);
+		yt_busy_timer = null;
+		$('#yt_busy').hide();
+	}
+
+	// web2py's trap_form handler is bound directly on the form, so it has already
+	// serialized the form data by the time this delegated handler runs.
+	$(document).on('submit', '#yt_step form', function() {
+		var form = $(this);
+		var btn = form.find('input.yt_submit');
+		btn.prop('disabled', true).addClass('disabled');
+		form.find('input[type=text], textarea').not('[readonly]').prop('readonly', true).addClass('yt_locked');
+		form.find('.yt_cancel').hide();
+		yt_reload_on_error = true;
+		ShowYTBusy(btn.data('busy_msg') || 'Working...');
+	});
+
+	$(document).on('w2p:componentComplete', function(e, xhr, status) {
+		if (!e.containerTarget || e.containerTarget.id !== 'yt_step') { return; }
+		HideYTBusy();
+		if (status === 'success' || status === 'notmodified') {
+			yt_reload_on_error = false;
+			return;
+		}
+		// updatePage has already replaced the form with the error body, so there is
+		// nothing left to re-enable. Load a fresh step 1 form once.
+		$('#yt_error').text('Something went wrong talking to the server (' + xhr.status + ' ' +
+			(xhr.statusText || status) + '). Please try again.').show();
+		if (yt_reload_on_error) {
+			yt_reload_on_error = false;
+			web2py_component("{{=URL('media', 'pull_from_youtube_step_1.load', user_signature=True)}}", "yt_step");
+		}
+	});
 </script>
 
 <h1>Pull Media From YouTube</h1>
@@ -40,8 +99,16 @@ $(function() {
     <span style="color: green; font-weight: bolder;">Requires online connection.</span>
 </div>
 <div>
-    {{=LOAD('media', 'pull_from_youtube_step_1.load', ajax=True, user_signature=True)}}
+    {{=LOAD('media', 'pull_from_youtube_step_1.load', ajax=True, user_signature=True, target='yt_step')}}
 </div>
+<div id="yt_busy" class="alert alert-info" style="display: none; margin-top: 8px; max-width: 800px;">
+	<img src="{{=URL('static', 'images/spinner.gif') }}" style="height: 20px; vertical-align: middle;" />
+	<b id="yt_busy_msg">Working...</b> <span id="yt_busy_elapsed"></span>
+	<div id="yt_busy_hint" style="display: none; font-size: 12px; margin-top: 4px;">
+		Still working - YouTube lookups can take up to a minute. Please don't refresh the page.
+	</div>
+</div>
+<div id="yt_error" class="alert alert-danger" style="display: none; margin-top: 8px; max-width: 800px;"></div>
 <hr />
 <h4>
 	YouTube Download Process Queue

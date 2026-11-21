@@ -244,9 +244,10 @@ def media_list():
         )
         
         vtt_files = get_media_captions_list(row.media_guid)
-        for v_file in vtt_files:
+        english = english_caption_track(vtt_files)
+        if english:
             file_list.append(
-                base_url + row.media_guid + "_" + v_file + ".vtt"
+                base_url + row.media_guid + "_" + english + ".vtt"
             )
         
         item["files"] = file_list
@@ -696,18 +697,13 @@ def player():
         source_mobile_mp4 = URL('static', 'media' + "/" + prefix + "/" + movie_id + ".mobile.mp4")
         source_webm = URL('static', 'media' + "/" + prefix + "/" + movie_id + ".webm")
 
-        # Get list of vtt files
-        vtt_files = get_media_captions_list(movie_id)
-        
-        # Build up the <tracks> tags
-        for f in vtt_files:
-            #<track kind="captions" src="source_en_subtitles"" srclang="en" label="English" default>
-            default_txt = ""
-            if f == "en":
-                default_txt = "default"
-            subtitles_html += "\n<track kind=\"captions\" src=\"" + \
-                URL('static', 'media' + "/" + prefix + "/" + movie_id + "_" + f + ".vtt") \
-                + "\" srclang=\"" + f + "\" label=\"" + vtt_files[f][1] + "\" " + default_txt + ">"
+        # One English track. Other languages are not offered, and it is on by default
+        # so the viewer does not have to pick it out of a long list.
+        english = english_caption_track(get_media_captions_list(movie_id))
+        if english:
+            subtitles_html = "\n<track kind=\"captions\" src=\"" + \
+                URL('static', 'media' + "/" + prefix + "/" + movie_id + "_" + english + ".vtt") \
+                + "\" srclang=\"en\" label=\"English\" default>"
 
         
         media_file = db(db.media_files.media_guid==movie_id).select().first()
@@ -1876,24 +1872,36 @@ def pull_from_youtube():
 @auth.requires(auth.has_membership('Faculty') or auth.has_membership('Administrators'))
 def pull_from_youtube_step_1():
     msg = request.vars.get('msg', '')
+    status_msg = ""
+    status_class = "alert-success"
     if len(msg) > 0:
-        response.flash = msg
-    
-    form = FORM(TABLE(TR("YouTube Link: ", INPUT(_type="text", _name="yt_url", requires=IS_NOT_EMPTY(), _style="width: 600px;")),
-                      TR("", INPUT(_type="submit", _value="Next"))), keepvalues=True, _name="yt_step1")
+        status_msg = msg
+        # Refresh the queue right away so the new video shows up without waiting for the next poll
+        response.js = "if (typeof RefreshYTQueue === 'function') { RefreshYTQueue(); }"
+
+    form = FORM(TABLE(TR("YouTube Link: ", INPUT(_type="text", _name="yt_url", requires=IS_NOT_EMPTY(),
+                                                 _style="width: 600px;", _placeholder="https://www.youtube.com/watch?v=...")),
+                      TR("", INPUT(_type="submit", _value="Next", _class="yt_submit",
+                                   data=dict(w2p_disable="true", busy_msg="Looking up video on YouTube...")))),
+                keepvalues=True, _name="yt_step1",
+                # Explicit action. Otherwise web2py reuses the previous component URL, and the
+                # next submit after step 2 posts straight to step 2, skipping this check.
+                _action=URL('media', 'pull_from_youtube_step_1.load', user_signature=True))
 
     if form.process(formname="yt_step1").accepted:
         yt_url = form.vars.yt_url
 
         if yt_url is None:
             response.flash = "Invalid YouTube URL"
-            return dict(form1=form)
+            return dict(form1=form, status_msg="Invalid YouTube URL", status_class="alert-danger")
 
         # Check if this video exists in the database already
         vid = db(db.media_files.youtube_url==yt_url).select().first()
         if vid is not None:
             # Video exists already
             response.flash = "Video already in SMC!"
+            status_msg = f"Video already in SMC: {vid.title}"
+            status_class = "alert-warning"
 
             # Pull caption file if it doesn't exist? - Done in scheduler now
             # caption_result = scheduler.queue_task('pull_youtube_caption',
@@ -1906,7 +1914,7 @@ def pull_from_youtube_step_1():
     elif form.errors:
         response.flash = "Form has errors!"
 
-    return dict(form1=form)
+    return dict(form1=form, status_msg=status_msg, status_class=status_class)
 
 
 @auth.requires(auth.has_membership('Faculty') or auth.has_membership('Administrators'))
@@ -1917,12 +1925,21 @@ def pull_from_youtube_step_2():
     else:
         yt_url = session.yt_url
 
+    # The video info was already looked up when this form was first displayed - don't hit
+    # YouTube again on submit, it makes queueing the video slow.
+    is_submit = request.post_vars._formname == "yt_step2"
+    yt_title = request.post_vars.title or ""
+    yt_description = request.post_vars.desc or ""
+
     yt = None
     stream = None
     res = ''
     try:
         # Get yt video info
-        yt, stream, res, return_code = find_best_yt_stream(yt_url)
+        if is_submit:
+            return_code = "OK"
+        else:
+            yt, stream, res, return_code = find_best_yt_stream(yt_url)
 
         if return_code != "OK":
             msg = f"Error getting YouTube Video - Video not available or blocked."  # + str(yt_url) + " " + str(ex)
@@ -1941,7 +1958,10 @@ def pull_from_youtube_step_2():
                               "Error: " +
                               str(ex) + str(traceback.print_exc()) + "</span>"))
 
-    if yt is None:
+    if yt is not None:
+        yt_title = yt.title
+        yt_description = yt.description
+    elif not is_submit:
         return dict(form2=XML("<span style='color: red; font-weight:bold;'>" +
                               "Error finding video</span> (" + str(yt_url) +
                               ") - reload page and try again.<br /> " +
@@ -1951,11 +1971,15 @@ def pull_from_youtube_step_2():
 
     # NOTE - Need form name separate from other steps for form to work properly
     form = FORM(TABLE(TR("YouTube Link:", INPUT(_type="text", _name="yt_url", _value=yt_url, _readonly=True)),
-                      TR("Title:", INPUT(_type="text", _name="title", _value=yt.title, requires=IS_NOT_EMPTY())),
-                      TR("Description:", TEXTAREA(_name="desc", value=yt.description)),
+                      TR("Title:", INPUT(_type="text", _name="title", _value=yt_title, requires=IS_NOT_EMPTY())),
+                      TR("Description:", TEXTAREA(_name="desc", value=yt_description)),
                       TR("Category:", INPUT(_type="text", _name="category")),
                       # TR("Keywords:", INPUT(_type="text", _name="keywords", value=    yt.keywords)),
-                      TR("", INPUT(_type="submit", _value="Download"))),
+                      TR("", SPAN(INPUT(_type="submit", _value="Download", _class="yt_submit",
+                                        data=dict(w2p_disable="true", busy_msg="Adding video to the download queue...")),
+                                  " ",
+                                  A("Cancel", _href=URL('media', 'pull_from_youtube.html'),
+                                    _class="yt_cancel", _style="margin-left: 10px;")))),
                 # INPUT(_type="hidden", _value=res, _name="res"),
                 # INPUT(_type="hidden", _value=yt.thumbnail_url, _name="thumbnail_url"),
                 # hidden=dict(res=res, thumbnail_url=yt.thumbnail_url),
@@ -1974,7 +1998,8 @@ def pull_from_youtube_step_2():
 
         # Show a start over button
         #form = A('Download another video', _href=URL('media', 'pull_from_youtube.html'))
-        redirect(URL('media', 'pull_from_youtube_step_1.load', vars=dict(msg='Video Queued')))
+        redirect(URL('media', 'pull_from_youtube_step_1.load',
+                     vars=dict(msg=f"Video queued for download: {form.vars.title}")))
     elif form.errors:
         response.flash = "ERROR " + str(form.errors)
     else:

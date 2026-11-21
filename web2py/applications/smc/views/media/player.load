@@ -1,4 +1,5 @@
 <link rel="stylesheet" href="{{= URL('static', 'video-js') }}/video-js.css" type="text/css" media="screen">
+<link rel="stylesheet" href="{{= URL('static', 'video-js') }}/captions.css?v=3" type="text/css" media="screen">
 <script type="text/javascript" src="{{= URL('static', 'video-js') }}/video-js-ie8.min.js"></script>
 
 <!-- jQuery('.video-js').bind('contextmenu',function() { return false; });  -->

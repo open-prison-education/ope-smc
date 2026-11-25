@@ -42,6 +42,11 @@ rm -f kill_smc.bat
 # DEV PORT
 DEV_PORT=7999
 
+# YouTube breaks yt-dlp often. Refresh it before either process imports it, so a daily
+# restart picks up the latest stable release. A failed update still starts on the installed copy.
+echo ${ESC_GREEN}Updating yt-dlp...${ESC_RESET}
+$PYEXE -m pip install -U 'yt-dlp[default]' 'yt-dlp-ejs' || echo ${ESC_YELLOW}yt-dlp update failed, starting with the installed version${ESC_RESET}
+
 echo ${ESC_GREEN}Starting YouTube scheduler...${ESC_RESET}
 $PYEXE -B web2py/web2py.py -K smc:youtube_queue >>/tmp/smc-youtube-scheduler.log 2>&1 &
 YT_SCHED_PID=$!

@@ -119,6 +119,9 @@ class Faculty:
             
             W2Py.CreateW2PFacultyUser(user_name, password, user_email, first_name, last_name,
                                       user_ad_quota, user_canvas_quota, row)
+            # Commit per faculty member so the write lock on storage.sqlite is held for one
+            # account, not the whole sheet (other saves give up after ~5 seconds)
+            db.commit()
         return count
 
     @staticmethod
@@ -398,6 +401,7 @@ class Faculty:
         for row in rows:
             count += 1
             db.faculty_ad_import_queue.insert(faculty_import_queue=row['id'])
+        db.commit()
 
         return count
 
@@ -419,6 +423,7 @@ class Faculty:
         for row in rows:
             count += 1
             db.faculty_canvas_import_queue.insert(faculty_import_queue=row['id'])
+        db.commit()
 
         return count
 

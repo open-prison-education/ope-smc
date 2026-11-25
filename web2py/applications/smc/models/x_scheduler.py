@@ -1691,6 +1691,11 @@ def run_maintenance_task(
             )
             print(f"-> New task started: {task_name} -> {result}")
 
+        # stop_task / queue_task don't commit. This runs while loading the models for an
+        # ordinary page view, so without a commit storage_scheduler.sqlite stays locked
+        # until that page finishes, and the scheduler and other workers time out on it.
+        db_scheduler.commit()
+
         # Task ran - reset things so we won't try to run it again for run_delay seconds
         current.cache.ram(task_name, lambda: False, time_expire=-1)
         return True

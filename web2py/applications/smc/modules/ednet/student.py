@@ -120,6 +120,9 @@ class Student:
             
             W2Py.CreateW2PStudentUser(user_name, password, user_email, first_name, last_name, user_ad_quota,
                                       user_canvas_quota, row)
+            # Commit per student so the write lock on storage.sqlite is held for one
+            # account, not the whole sheet (other saves give up after ~5 seconds)
+            db.commit()
         return count
 
     @staticmethod
@@ -399,6 +402,7 @@ class Student:
         for row in rows:
             count += 1
             db.student_ad_import_queue.insert(student_import_queue=row['id'])
+        db.commit()
 
         return count
 
@@ -420,6 +424,7 @@ class Student:
         for row in rows:
             count += 1
             db.student_canvas_import_queue.insert(student_import_queue=row['id'])
+        db.commit()
 
         return count
 
